@@ -1,0 +1,565 @@
+---
+title: "Identifying Biomarkers from ADNI data"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r import libraries}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tidyverse)
+library(car)
+library(caret)
+library(pROC)
+library(pheatmap)
+library(clusterProfiler)
+library(cowplot)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(DOSE)
+library(igraph)
+```
+
+```{r read data}
+# Read the cleaned and preprocessed prot_exp data
+prot_exp <- read.csv('SourceData/prot_exp_data.csv', header = TRUE)
+prot_exp
+
+expr_data <- prot_exp[, grep("^X", colnames(prot_exp))]
+
+# Cross Reference Analyte names and Protein names
+ana_prot_info <- read.csv('SourceData/ADNI_Analyte_protein_info.csv')[,c("Analytes","EntrezGeneSymbol")]
+colnames(ana_prot_info) <- c('Analyte', "Protein")
+```
+
+#Applying Multiple Regression in Pairs 
+
+##CNvsAD
+``` {r Subset: CNvsAD}
+# Defining Subgroup
+prot_cn_ad <- subset(prot_exp, DX.bl %in% c("CN", "AD"))
+
+# Select protein columns
+expr_data <- prot_cn_ad[, grep("^X", colnames(prot_cn_ad))]
+rownames(expr_data) <- prot_cn_ad$RID
+```
+
+``` {r Sample Protein trial CRYBB2}
+#X10000.28 (CRYBB2)
+prot <- expr_data[,1]
+covariates <- prot_cn_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+
+group <- factor(prot_cn_ad$DX.bl, levels = c("CN", "AD"))
+model <- glm(group ~ prot + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+
+summary(model)$coefficients['prot',]
+```
+
+```{r Displaying the MLR graph for CRYBB2}
+avPlots(model)
+```
+
+``` {r Sample Protein trial MMP10}
+# X10479.18 (MMP10) 
+prot <- expr_data[,94]
+covariates <- prot_cn_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+
+group <- factor(prot_cn_ad$DX.bl, levels = c("CN", "AD"))
+model <- glm(group ~ prot + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+
+summary(model)$coefficients['prot',]
+```
+
+```{r Displaying the MLR graph for MMP10}
+avPlots(model)
+```
+
+``` {r Apply MLR to CN vs AD}
+# Define group
+group <- factor(prot_cn_ad$DX.bl, levels = c("CN", "AD"))
+
+# Additional covariates (Age, Gender, Education, APOE4)
+covariates <- prot_cn_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+covariates$PTGENDER <- as.factor(covariates$PTGENDER)
+covariates$APOE4 <- as.factor(covariates$APOE4)
+
+# Apply GLM to each protein expression
+glm_results_cn_ad <- apply(expr_data, 2, function(prot) {
+  model <- glm(group ~ prot + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+  summary(model)$coefficients['prot',]
+})
+```
+
+``` {r Modify and Save results}
+glm_df_cn_ad <- as.data.frame(t(glm_results_cn_ad))
+colnames(glm_df_cn_ad) <- c("Estimate", "Std.Error", "z.value", "P.Value")
+
+# Bonferroni Correction
+glm_df_cn_ad$bonferroni <- p.adjust(glm_df_cn_ad$P.Value, method = "bonferroni")
+
+# Analyte and Protein conversion
+glm_df_cn_ad$Analyte <- row.names(glm_df_cn_ad)
+glm_df_cn_ad <- merge(glm_df_cn_ad, ana_prot_info, by = 'Analyte')
+
+write.csv(glm_df_cn_ad, "Results/glm_results_CN_AD_glm.csv",row.names = FALSE)
+``` 
+
+``` {r DE Proteins for CN vs AD with fdr cutoff 0.01}
+fdr_cutoff = 0.01
+
+glm_df_cn_ad$fdr <- p.adjust(glm_df_cn_ad$P.Value, method = "fdr")
+
+# Filter for FDR < 0.01
+de_proteins_cn_ad <- glm_df_cn_ad[glm_df_cn_ad$fdr < 0.01, ]
+write.csv(de_proteins_cn_ad,"Results/deproteins_CN_AD.csv",row.names = FALSE)
+```
+
+``` {r Volcano plot CN vs AD}
+# x: log2fc = Estimate
+# y: -log10(fdr) 
+glm_df_cn_ad$neg_log10fdr <- -log10(glm_df_cn_ad$fdr)
+
+ggplot(data = glm_df_cn_ad, mapping = aes(x = Estimate, y = neg_log10fdr)) +
+  geom_point(aes(color = (fdr < 0.05 & abs(Estimate) > 0.5)), size = 1) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+  geom_text_repel(
+    data = subset(glm_df_cn_ad, fdr < 0.05 & abs(Estimate) > 0.5),
+    aes(label = Protein),
+    max.overlaps = 15
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Volcano Plot: CN vs AD",
+    x = "log2 Fold Change",
+    y = "-log10(fdr)",
+    color = "FDR < 0.05"
+  )
+```
+
+```{r DE Proteins with bonferroni cutoff of 0.05 }
+bonferroni_cutoff <- 0.05
+log2fc_cutoff <- 1
+
+# Filter for FDR < 0.01
+de_proteins_cn_ad_b <- de_proteins_cn_ad[(de_proteins_cn_ad$bonferroni < 0.05 & de_proteins_cn_ad$Estimate > 1), ]
+de_proteins_cn_ad_b
+write.csv(de_proteins_cn_ad_b,"Results/deproteins_CN_AD_bonferroni.csv",row.names = FALSE)
+```
+
+
+
+##CNvsMCI
+``` {r Subset CN vs MCI}
+prot_cn_mci <- subset(prot_exp, DX.bl %in% c("CN", "MCI"))
+expr_data <- prot_cn_mci[, grep("^X", colnames(prot_cn_mci))]
+rownames(expr_data) <- prot_cn_mci$RID
+
+```
+
+``` {r Apply MLR}
+group <- factor(prot_cn_mci$DX.bl, levels = c("CN", "MCI"))
+covariates <- prot_cn_mci[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+covariates$PTGENDER <- as.factor(covariates$PTGENDER)
+covariates$APOE4 <- as.factor(covariates$APOE4)
+
+glm_results_cn_mci <- apply(expr_data, 2, function(prot) {
+  model <- glm(group ~ prot + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+  summary(model)$coefficients['prot',]
+})
+
+``` 
+
+``` {r Modify and Save Results}
+glm_df_cn_mci <- as.data.frame(t(glm_results_cn_mci))
+colnames(glm_df_cn_mci) <- c("Estimate", "Std.Error", "z.value", "P.Value")
+
+glm_df_cn_mci$bonferroni <- p.adjust(glm_df_cn_mci$P.Value, method = "bonferroni")
+
+# Analyte and Protein conversion
+glm_df_cn_mci$Analyte <- row.names(glm_df_cn_mci)
+glm_df_cn_mci <- merge(glm_df_cn_mci, ana_prot_info, by = 'Analyte')
+
+write.csv(glm_df_cn_mci, "Results/glm_results_CN_MCI_glm.csv", row.names = FALSE)
+
+``` 
+
+```{r Find DE Proteins for CN and MCI with fdr cutoff 0.01}
+fdr_cutoff = 0.01
+
+glm_df_cn_mci$fdr <- p.adjust(glm_df_cn_mci$P.Value, method = "fdr")
+
+# Filter for FDR < 0.01
+de_proteins_cn_mci <- glm_df_cn_mci[glm_df_cn_mci$fdr < 0.01, ]
+de_proteins_cn_mci
+write.csv(de_proteins_cn_mci,"Results/deproteins_CN_MCI.csv",row.names = FALSE)
+```
+
+``` {r Volcano plot CN vs MCI}
+# x: log2fc = Estimate
+# y: -log10(fdr) 
+glm_df_cn_mci$neg_log10fdr <- -log10(glm_df_cn_mci$fdr)
+
+ggplot(data = glm_df_cn_mci, mapping = aes(x = Estimate, y = neg_log10fdr)) +
+  geom_point(aes(color = (fdr < 0.05 & abs(Estimate) > 0.5)), size = 2) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+  geom_text_repel(
+    data = subset(glm_df_cn_mci, fdr < 0.05 | abs(Estimate) > 0.5),
+    aes(label = Protein)
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Volcano Plot: CN vs MCI",
+    x = "log2 Fold Change",
+    y = "-log10(fdr)",
+    color = "FDR < 0.05"
+  )
+```
+
+```{r DE Proteins with bonferroni cutoff of 0.05 }
+bonferroni_cutoff <- 0.05
+
+# Filter for FDR < 0.01
+de_proteins_cn_mci_b <- de_proteins_cn_mci[(de_proteins_cn_mci$bonferroni < 0.05), ]
+de_proteins_cn_mci_b
+write.csv(de_proteins_cn_mci_b,"Results/deproteins_CN_MCI_bonferroni.csv",row.names = FALSE)
+```
+
+
+##MCIvsAD
+``` {r Subsetting MCI vs AD}
+prot_mci_ad <- subset(prot_exp, DX.bl %in% c("MCI", "AD"))
+expr_data <- prot_mci_ad[, grep("^X", colnames(prot_mci_ad))]
+rownames(expr_data) <- prot_mci_ad$RID  
+
+```
+
+``` {r Apply MLR}
+group <- factor(prot_mci_ad$DX.bl, levels = c("MCI", "AD"))
+covariates <- prot_mci_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+covariates$PTGENDER <- as.factor(covariates$PTGENDER)
+covariates$APOE4 <- as.factor(covariates$APOE4)
+
+glm_results_mci_ad <- apply(expr_data, 2, function(prot) {
+  model <- glm(group ~ prot + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+  summary(model)$coefficients['prot',]
+})
+
+```
+
+``` {r Modify results and save 'em}
+glm_df_mci_ad <- as.data.frame(t(glm_results_mci_ad))
+colnames(glm_df_mci_ad) <- c("Estimate", "Std.Error", "z.value", "P.Value")
+
+glm_df_mci_ad$bonferroni <- p.adjust(glm_df_mci_ad$P.Value, method = "bonferroni")
+
+# Analyte and Protein conversion
+glm_df_mci_ad$Analyte <- row.names(glm_df_mci_ad)
+glm_df_mci_ad <- merge(glm_df_mci_ad, ana_prot_info, by = 'Analyte')
+
+write.csv(glm_df_mci_ad, "Results/glm_results_MCI_AD_glm.csv", row.names = FALSE)
+```
+
+```{r DE Proteins for MCI vs AD with fdr cutoff 0.05}
+fdr_cutoff = 0.01
+
+glm_df_mci_ad$fdr <- p.adjust(glm_df_mci_ad$P.Value, method = "fdr")
+
+# Filter for FDR < 0.05
+de_proteins_mci_ad <- glm_df_mci_ad[glm_df_mci_ad$fdr < 0.01, ]
+de_proteins_mci_ad
+write.csv(de_proteins_mci_ad,"Results/deproteins_MCI_AD.csv",row.names = FALSE)
+```
+
+``` {r Volcano plot MCI vs AD}
+# x: log2fc = Estimate
+# y: -log10(fdr) 
+glm_df_mci_ad$neg_log10fdr <- -log10(glm_df_mci_ad$fdr)
+
+ggplot(data = glm_df_mci_ad, mapping = aes(x = Estimate, y = neg_log10fdr)) +
+  geom_point(aes(color = (fdr < 0.05 & abs(Estimate) > 0.5)), size = 2) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+  geom_text_repel(
+    data = subset(glm_df_mci_ad, fdr < 0.05 | abs(Estimate) > 0.5),
+    aes(label = Protein)
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Volcano Plot: MCI vs AD",
+    x = "log2 Fold Change",
+    y = "-log10(fdr)",
+    color = "FDR < 0.05"
+  )
+```
+
+```{r DE Proteins with bonferroni cutoff of 0.05 }
+bonferroni_cutoff <- 0.05
+
+# Filter for FDR < 0.01
+de_proteins_mci_ad_b <- glm_df_mci_ad[(glm_df_mci_ad$bonferroni < 0.05), ]
+de_proteins_mci_ad_b
+write.csv(de_proteins_mci_ad_b,"Results/deproteins_MCI_AD_bonferroni.csv",row.names = FALSE)
+```
+
+
+
+
+#AUC
+```{r Combine all de proteins for AUC}
+# identical(names(de_proteins_cn_ad),names(de_proteins_cn_mci))
+de_proteins_cn_ad$Compare <- 'CNvsAD'
+de_proteins_cn_mci$Compare <- 'CNvsMCI'
+de_proteins_mci_ad$Compare <- 'MCIvsAD'
+de_proteins <- rbind(de_proteins_cn_ad, de_proteins_cn_mci, de_proteins_mci_ad)
+de_proteins <- de_proteins[!duplicated(de_proteins['Analyte']),]
+de_proteins
+```
+
+```{r Get AUC for the proteins by 5 Fold Cross Validation }
+# Function to compute AUC for a single protein
+calc_protein_auc <- function(protein, data, grp0, grp1) {
+
+  data$group <- factor(data$DX.bl, levels = c(grp0, grp1))
+  data$protein <- data[[protein]]
+
+  # Drop rows with NA in group or protein
+  data <- data[!is.na(data$group) & !is.na(data$protein), ]
+
+  cv_control <- trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = TRUE
+  )
+
+  model <- train(
+    group ~ protein + AGE + PTGENDER + PTEDUCAT + APOE4,
+    data = data,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  )
+
+  return(model$results$ROC)
+}
+
+```
+
+```{r IGNORE}
+# seq_len(nrow(de_proteins))
+```
+
+```{r}
+# Initialize results dataframe
+auc_results <- data.frame(Analyte = character(), Compare = character(), MeanAUC = numeric())
+
+# Loop through proteins
+for (i in c(1:nrow(de_proteins))) {
+  
+  analyte <- de_proteins$Analyte[i]
+  compare_string <- de_proteins$Compare[i]
+  protein <- de_proteins$Protein[i]
+  
+  # Split Compare string
+  groups <- unlist(strsplit(compare_string, "vs"))
+  grp0 <- groups[1]
+  grp1 <- groups[2]
+
+  # Select correct dataframe
+  data <- switch(compare_string,
+                 CNvsAD = prot_cn_ad,
+                 CNvsMCI = prot_cn_mci,
+                 MCIvsAD = prot_mci_ad,
+                 NULL)
+  
+  # model
+    auc_value <- calc_protein_auc(analyte, data, grp0, grp1)
+    
+    auc_results <- rbind(auc_results,
+      data.frame(Analyte = analyte, ProteinName = protein,
+                 Compare = compare_string, MeanAUC = auc_value)
+    )
+}
+
+
+```
+
+```{r}
+auc_results
+```
+
+```{r}
+# Save results
+write.csv(auc_results, "Results/AUC_deproteins.csv", row.names = FALSE)
+```
+
+
+# Heatmaps
+
+## pval correlation heatmap
+```{r Get the heatmap data (numeric)}
+heatmap_data <- dplyr::select(prot_exp, all_of(de_proteins$Analyte))
+
+
+# Calculate Protein-Protein Correlation Matrix
+correlation_matrix <- cor(heatmap_data, use = "pairwise.complete.obs", method = "pearson")
+
+```
+
+```{r Make the heatmap}
+protein_names <- de_proteins$Protein
+names(protein_names) <- de_proteins$Analyte
+
+rownames(correlation_matrix) <- protein_names[colnames(correlation_matrix)]
+colnames(correlation_matrix) <- protein_names[colnames(correlation_matrix)]
+
+pheatmap(
+  correlation_matrix,
+  scale = "none",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  main = "Protein-Protein Correlation Heatmap",
+  color = colorRampPalette(c("blue", "white", "red"))(100)
+)
+```
+
+```{r correlation matrix display (don't run)}
+# correlation_matrix
+```
+
+```{r}
+# Create adjacency matrix where TRUE if correlation >= 0
+adj_matrix <- correlation_matrix >= 0.8
+diag(adj_matrix) <- FALSE  # Remove self-loops
+
+g <- graph_from_adjacency_matrix(adj_matrix, mode = "undirected", diag = FALSE)
+
+# Find connected components (i.e., groups of correlated proteins)
+components <- components(g)
+
+cat(components$no, "\n\n")
+
+# Print each group with its proteins
+for (i in seq_len(components$no)) {
+  cat("Group", i, ":\n")
+  print(names(components$membership[components$membership == i]))
+  cat("\n")
+}
+```
+
+## cluster profiler Heatmap
+
+```{r Get gene/protein list for KEGG Enrichment}
+protein_names <- unique(de_proteins$Protein)
+
+# Convert SYMBOL to ENTREZID for KEGG
+gene_df <- bitr(protein_names,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db)
+gene_df
+```
+```{r KEGG enrichment}
+kegg_enrich <- enrichKEGG(gene = gene_df$ENTREZID,
+                          organism = 'hsa',
+                          pvalueCutoff = 0.05)
+kegg_enrich <- setReadable(kegg_enrich, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+
+```
+
+```{r dot plot}
+dotplot(kegg_enrich, showCategory = 10, title = "KEGG Dotplot")
+```
+
+```{r heat map }
+p1<- heatplot(kegg_enrich, showCategory = 6)
+fc_df <- merge(gene_df,de_proteins, by.x = 'SYMBOL',by.y = 'Protein')
+foldchange_vector <- fc_df$Estimate
+names(foldchange_vector) <- fc_df$ENTREZID
+p2 <- heatplot(kegg_enrich, foldChange=foldchange_vector, showCategory=6)
+plot_grid(p1, p2, ncol=1, labels=LETTERS[1:2])
+```
+
+
+```{r Applying MLR to 2 proteins MMP10 and YWHAG}
+# MMP10 and YWHAG
+# Defining Subgroup
+prot_cn_ad <- subset(prot_exp, DX.bl %in% c("CN", "AD"))
+
+# Select protein columns
+expr_data <- prot_cn_ad[, grep("^X", colnames(prot_cn_ad))]
+rownames(expr_data) <- prot_cn_ad$RID
+
+mmp10 <- expr_data[,94]
+covariates <- prot_cn_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+ywhag <- expr_data[,4854]
+group <- factor(prot_cn_ad$DX.bl, levels = c("CN", "AD"))
+model <- glm(group ~ mmp10 + ywhag + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+
+summary(model)$coefficients
+
+pred_probs <- predict(model, type = "response")
+
+roc_obj <- roc(group, pred_probs)
+auc(roc_obj)
+```
+```{r Protein panel AUC (YWHAG, SMOC1, PIGR and TMOD2) from publication}
+prot_cn_ad <- subset(prot_exp, DX.bl %in% c("CN", "AD"))
+
+expr_data <- prot_cn_ad[, grep("^X", colnames(prot_cn_ad))]
+rownames(expr_data) <- prot_cn_ad$RID
+
+tmod2 <- expr_data[,945]          # X12853.112
+smoc1 <- expr_data[,5325]         # X5694.57
+ywhag <- expr_data[,4854]         # X4179.57
+pigr <- expr_data[,4546]          # X3216.2
+covariates <- prot_cn_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+
+group <- factor(prot_cn_ad$DX.bl, levels = c("CN", "AD"))
+model <- glm(group ~ tmod2 + ywhag + smoc1 + pigr + 
+               AGE + PTGENDER + PTEDUCAT + APOE4, 
+             data = covariates, family = binomial)
+
+summary(model)$coefficients
+
+pred_probs <- predict(model, type = "response")
+
+roc_obj <- roc(group, pred_probs)
+auc(roc_obj)
+```
+```{r}
+table(prot_cn_ad$DX.bl)
+```
+```{r 3 top Proteins from this analysis }
+prot_cn_ad <- subset(prot_exp, DX.bl %in% c("CN", "AD"))
+
+# Select protein columns
+expr_data <- prot_cn_ad[, grep("^X", colnames(prot_cn_ad))]
+rownames(expr_data) <- prot_cn_ad$RID
+
+covariates <- prot_cn_ad[, c("AGE", "PTGENDER", "PTEDUCAT", "APOE4")]
+mmp10 <- expr_data[,94]     # X10479.18
+ywhag <- expr_data[,4854]   # X4179.57
+homer1 <-expr_data[,2382]   # X19229.92
+
+
+group <- factor(prot_cn_ad$DX.bl, levels = c("CN", "AD"))
+model <- glm(group ~ mmp10 + ywhag + homer1 + AGE + PTGENDER + PTEDUCAT + APOE4, data = covariates, family = binomial)
+
+summary(model)$coefficients
+
+pred_probs <- predict(model, type = "response")
+
+roc_obj <- roc(group, pred_probs)
+auc(roc_obj)
+```
+
