@@ -1,5 +1,5 @@
 ---
-title: "Identifying Biomarkers from ADNI data"
+title: "Identifying Protein Biomarkers from ADNI data"
 output:
   html_document:
     df_print: paged
