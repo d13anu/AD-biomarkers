@@ -4,3 +4,5 @@ SourceData
 .idea
 .DS_store
 not_working_code.txt
+/.Rhistory
+/meta_de_mlr.Rmd
